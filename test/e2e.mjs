@@ -295,6 +295,14 @@ for (const PROTO of [1, 2]) {
             check('desktop error before the head → 502', res.status === 502, `status=${res.status}`);
         }
         {
+            // A frame with a base64 payload that is not valid base64 must not
+            // take the message handler down: the body keeps coming (Node's
+            // Buffer.from skips the characters outside the alphabet).
+            const res = await fetch(`${base}/api/bad-b64`);
+            const body = await res.text();
+            check('a malformed base64 chunk does not stop the body', res.status === 200 && body === 'helloworld', `${res.status} ${JSON.stringify(body)}`);
+        }
+        {
             const t0 = Date.now();
             const reader = (await fetch(`${base}/api/sse`)).body.getReader();
             let first = 0;

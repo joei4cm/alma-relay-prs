@@ -134,6 +134,10 @@ const backend = createServer((req, res) => {
         res.writeHead(204);
         return res.end();
     }
+    if (req.url === '/api/cookies') {
+        res.writeHead(200, { 'content-type': 'text/plain', 'set-cookie': ['a=1; Path=/', 'b=2; Path=/'] });
+        return res.end('cookies');
+    }
     if (req.url === '/api/drop') {
         // The desktop's own request fails before any response head → herr.
         return req.socket.destroy();
@@ -295,6 +299,19 @@ for (const PROTO of [1, 2]) {
         {
             const res = await fetch(`${base}/api/empty`, { method: 'DELETE' });
             check('204 with no body', res.status === 204, `status=${res.status}`);
+        }
+        {
+            // A header the desktop sends as a list (set-cookie) must stay a
+            // list on the way out, not one comma-joined line.
+            const res = await fetch(`${base}/api/cookies`);
+            const cookies = res.headers.getSetCookie();
+            check('two Set-Cookie headers stay two headers', res.status === 200 && cookies.length === 2 && cookies[0] === 'a=1; Path=/' && cookies[1] === 'b=2; Path=/', JSON.stringify(cookies));
+        }
+        if (EDITION === 'cloudflare') {
+            // A status outside 200-599 cannot be built into a web Response;
+            // the phone gets the relay's own answer, not a worker-level error.
+            const status = await fetch(`${base}/api/status-99`).then(r => r.status, () => 'error');
+            check('a status the platform cannot represent → 502', status === 502, String(status));
         }
         {
             const res = await fetch(`${base}/api/drop`);

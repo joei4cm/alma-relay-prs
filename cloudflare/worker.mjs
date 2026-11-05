@@ -286,6 +286,10 @@ export class TunnelDO extends DurableObject {
 
     /** A phone WebSocket message (string or ArrayBuffer), in the form the agent speaks. */
     sendWsToAgent(id, message) {
+        // The desktop is done with this socket (it answered wclose or werr):
+        // the phone must not reach it any more.
+        const client = this.clientSocket(id);
+        if (client && (client.deserializeAttachment() || {}).agentClosed) return;
         const isBinary = typeof message !== 'string';
         if (this.agentProto() >= 2) {
             return this.sendBinaryToAgent(isBinary ? BIN.WBIN : BIN.WTEXT, id, isBinary ? new Uint8Array(message) : message);
@@ -580,7 +584,6 @@ export class TunnelDO extends DurableObject {
 
         if (attachment.role === 'client') {
             // Phone -> desktop traffic on a bridged socket.
-            if (attachment.agentClosed) return; // the desktop is done with it
             const queue = this.preOpenQueues.get(attachment.id);
             if (queue) queue.push(message);
             else this.sendWsToAgent(attachment.id, message);

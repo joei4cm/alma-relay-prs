@@ -132,14 +132,6 @@ export class FakeAgent {
         const { backendPort } = this.opts;
         switch (frame.t) {
             case 'hreq': {
-                // A test path: a response head with a status the web
-                // platform cannot represent (outside 200-599).
-                if (frame.path.startsWith('/api/status-99')) {
-                    this.send({ t: 'hres', id: frame.id, status: 99, headers: { 'content-type': 'text/plain' } });
-                    this.sendBody(frame.id, Buffer.from('nope'));
-                    this.send({ t: 'hend', id: frame.id });
-                    break;
-                }
                 const req = httpRequest(
                     {
                         host: '127.0.0.1',

@@ -468,8 +468,8 @@ export class TunnelDO extends DurableObject {
             return new Response(stream, { status: res.status, headers: resHeaders });
         } catch {
             // A status outside 200-599 has no web Response. The Node edition
-            // refuses it at writeHead and hangs up; here the phone gets the
-            // relay's own answer instead of a worker-level error.
+            // hands such a status to the phone as it is; here the phone gets
+            // the relay's own answer instead of a worker-level error.
             this.sendToAgent({ t: 'hcancel', id });
             this.pending.delete(id);
             clearTimeout(entry.timer);

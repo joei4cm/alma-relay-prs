@@ -580,6 +580,7 @@ export class TunnelDO extends DurableObject {
 
         if (attachment.role === 'client') {
             // Phone -> desktop traffic on a bridged socket.
+            if (attachment.agentClosed) return; // the desktop is done with it
             const queue = this.preOpenQueues.get(attachment.id);
             if (queue) queue.push(message);
             else this.sendWsToAgent(attachment.id, message);
@@ -709,6 +710,7 @@ export class TunnelDO extends DurableObject {
             }
             case 'werr': {
                 this.preOpenQueues.delete(String(frame.id));
+                this.markAgentClosed(String(frame.id));
                 this.closeClientSocket(String(frame.id), 1011, 'Desktop could not open the socket');
                 break;
             }
@@ -725,6 +727,7 @@ export class TunnelDO extends DurableObject {
             }
             case 'wclose': {
                 this.preOpenQueues.delete(String(frame.id));
+                this.markAgentClosed(String(frame.id));
                 this.closeClientSocket(String(frame.id), sanitizeCloseCode(frame.code), String(frame.reason || ''));
                 break;
             }
@@ -745,6 +748,22 @@ export class TunnelDO extends DurableObject {
         }
     }
 
+    /**
+     * The desktop is done with this socket: when the phone's close event
+     * arrives, the relay must not send a `wclose` back for a socket the
+     * desktop itself just closed or failed to open (Node deletes its bridge
+     * first, so its close handler stays silent for these).
+     */
+    markAgentClosed(id) {
+        const client = this.clientSocket(id);
+        if (!client) return;
+        try {
+            client.serializeAttachment({ role: 'client', id, agentClosed: true });
+        } catch {
+            /* gone */
+        }
+    }
+
     async webSocketClose(ws, code, reason) {
         // Finish the close handshake: the runtime does not answer the peer's
         // close frame for us, and until we close our end the peer sits in
@@ -760,7 +779,7 @@ export class TunnelDO extends DurableObject {
             this.dropTunnels('Desktop disconnected');
         } else if (attachment.role === 'client') {
             this.preOpenQueues.delete(attachment.id);
-            this.sendToAgent({ t: 'wclose', id: attachment.id, code: sanitizeCloseCode(code), reason: String(reason || '').slice(0, 120) });
+            if (!attachment.agentClosed) this.sendToAgent({ t: 'wclose', id: attachment.id, code: sanitizeCloseCode(code), reason: String(reason || '').slice(0, 120) });
         }
     }
 
@@ -776,6 +795,8 @@ export class TunnelDO extends DurableObject {
         this.preOpenQueues.clear();
         for (const client of this.ctx.getWebSockets('client')) {
             try {
+                const att = client.deserializeAttachment() || {};
+                if (att.role === 'client') client.serializeAttachment({ ...att, agentClosed: true });
                 client.close(1012, reason);
             } catch {
                 /* ignore */

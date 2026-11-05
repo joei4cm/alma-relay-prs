@@ -210,6 +210,7 @@ export class TunnelDO extends DurableObject {
         // the DO cannot hibernate while one is active.
         this.pending = new Map(); // id -> {enqueue, close, fail, headResolve, timer, headersSent}
         this.preOpenQueues = new Map(); // client ws id -> {frames, bytes} queued until agent sends wopened
+        this.queueKeepalive = null; // timer holding the DO awake while the queue has entries
         this.counter = 0;
         // APNs signer (see ../../apns.mjs); null when the deployment has no
         // APNS_KEY secret — the agent is then told `unsupported` and the
@@ -348,6 +349,7 @@ export class TunnelDO extends DurableObject {
         this.ctx.acceptWebSocket(server, ['client', `c:${id}`]);
         server.serializeAttachment({ role: 'client', id });
         this.preOpenQueues.set(id, { frames: [], bytes: 0 });
+        this.syncQueueKeepalive();
         this.sendToAgent({ t: 'wopen', id, path: url.pathname + url.search });
         return new Response(null, { status: 101, webSocket: client });
     }
@@ -615,6 +617,7 @@ export class TunnelDO extends DurableObject {
                 // in this Durable Object's memory. Cut the phone off instead
                 // of holding on to it (the Node edition closes with 1009).
                 this.preOpenQueues.delete(attachment.id);
+                this.syncQueueKeepalive();
                 const client = this.clientSocket(attachment.id);
                 try {
                     client?.close(1009, 'Too much data before the desktop answered');
@@ -743,11 +746,13 @@ export class TunnelDO extends DurableObject {
             case 'wopened': {
                 const queue = this.preOpenQueues.get(String(frame.id));
                 this.preOpenQueues.delete(String(frame.id));
+                this.syncQueueKeepalive();
                 for (const queued of queue?.frames || []) this.sendWsToAgent(String(frame.id), queued);
                 break;
             }
             case 'werr': {
                 this.preOpenQueues.delete(String(frame.id));
+                this.syncQueueKeepalive();
                 this.closeClientSocket(String(frame.id), 1011, 'Desktop could not open the socket');
                 break;
             }
@@ -764,6 +769,7 @@ export class TunnelDO extends DurableObject {
             }
             case 'wclose': {
                 this.preOpenQueues.delete(String(frame.id));
+                this.syncQueueKeepalive();
                 this.closeClientSocket(String(frame.id), sanitizeCloseCode(frame.code), String(frame.reason || ''));
                 break;
             }
@@ -772,6 +778,22 @@ export class TunnelDO extends DurableObject {
 
     clientSocket(id) {
         return this.ctx.getWebSockets(`c:${id}`)[0] || null;
+    }
+
+    /**
+     * The queue lives only in this object's memory: if the DO hibernated
+     * between `wopen` and `wopened`, the frames would be gone (in-memory
+     * state does not survive a wake; a socket attachment holds at most
+     * 16 KiB). A scheduled timer is what keeps a Durable Object awake,
+     * so one runs while any queue has entries.
+     */
+    syncQueueKeepalive() {
+        if (this.preOpenQueues.size > 0 && !this.queueKeepalive) {
+            this.queueKeepalive = setInterval(() => {}, 60_000);
+        } else if (this.preOpenQueues.size === 0 && this.queueKeepalive) {
+            clearInterval(this.queueKeepalive);
+            this.queueKeepalive = null;
+        }
     }
 
     closeClientSocket(id, code, reason) {
@@ -799,6 +821,7 @@ export class TunnelDO extends DurableObject {
             this.dropTunnels('Desktop disconnected');
         } else if (attachment.role === 'client') {
             this.preOpenQueues.delete(attachment.id);
+            this.syncQueueKeepalive();
             this.sendToAgent({ t: 'wclose', id: attachment.id, code: sanitizeCloseCode(code), reason: String(reason || '').slice(0, 120) });
         }
     }
@@ -813,6 +836,7 @@ export class TunnelDO extends DurableObject {
             this.pending.delete(id);
         }
         this.preOpenQueues.clear();
+        this.syncQueueKeepalive();
         for (const client of this.ctx.getWebSockets('client')) {
             try {
                 client.close(1012, reason);

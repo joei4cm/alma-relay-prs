@@ -85,11 +85,17 @@ export class FakeAgent {
         this.ws.send(encodeBinary(kind, id, payload));
     }
 
-    /** Response body bytes, as hchunk JSON (protocol 1) or HCHUNK (2). */
-    sendBody(id, bytes) {
+    /**
+     * Response body bytes, as hchunk JSON (protocol 1) or HCHUNK (2).
+     * With `corrupt` (protocol 1 only) the base64 payload gets characters
+     * outside the alphabet in front of it: the relay must not fall over such
+     * a frame.
+     */
+    sendBody(id, bytes, { corrupt = false } = {}) {
         if (this.proto >= 2) return this.sendBinary(BIN.HCHUNK, id, bytes);
         this.stats.jsonData++;
-        this.send({ t: 'hchunk', id, b: Buffer.from(bytes).toString('base64') });
+        const b64 = Buffer.from(bytes).toString('base64');
+        this.send({ t: 'hchunk', id, b: corrupt ? `!!!${b64}` : b64 });
     }
 
     sendWs(id, data, isBinary) {
@@ -139,15 +145,6 @@ export class FakeAgent {
                     this.send({ t: 'hend', id: frame.id });
                     break;
                 }
-                // A test path: a response body that starts with a frame whose
-                // base64 payload is not valid base64.
-                if (frame.path.startsWith('/api/bad-b64')) {
-                    this.send({ t: 'hres', id: frame.id, status: 200, headers: { 'content-type': 'text/plain' } });
-                    this.send({ t: 'hchunk', id: frame.id, b: '!!!aGVsbG8=' }); // garbage + "hello"
-                    this.sendBody(frame.id, Buffer.from('world'));
-                    this.send({ t: 'hend', id: frame.id });
-                    break;
-                }
                 const req = httpRequest(
                     {
                         host: '127.0.0.1',
@@ -157,9 +154,14 @@ export class FakeAgent {
                         headers: { ...frame.headers, 'accept-encoding': 'identity' },
                     },
                     res => {
-                        this.send({ t: 'hres', id: frame.id, status: res.statusCode, headers: res.headers });
+                        // A backend that asks for it gets its body sent with a
+                        // base64 payload that is not valid base64.
+                        const corrupt = res.headers['x-alma-corrupt-base64'] !== undefined;
+                        const headers = { ...res.headers };
+                        delete headers['x-alma-corrupt-base64'];
+                        this.send({ t: 'hres', id: frame.id, status: res.statusCode, headers });
                         res.on('data', chunk => {
-                            this.sendBody(frame.id, chunk);
+                            this.sendBody(frame.id, chunk, { corrupt });
                             // Like Alma's desktop, wait for the relay socket to drain.
                             if (this.ws.bufferedAmount > 1024 * 1024) {
                                 res.pause();

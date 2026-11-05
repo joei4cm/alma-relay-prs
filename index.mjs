@@ -583,7 +583,11 @@ function streamRequest(agent, req, res, path) {
         if (!live()) return upload.stop(); // the desktop already answered, or gave up
         size += chunk.length;
         if (size > MAX_BODY) {
-            res.setHeader('Connection', 'close');
+            // The desktop may have answered already (hres), in which case
+            // the head is on the wire: setHeader would throw
+            // ERR_HTTP_HEADERS_SENT out of this listener and take the
+            // process down. fail() destroys the response there instead.
+            if (!res.headersSent) res.setHeader('Connection', 'close');
             fail(413, 'Request body too large');
             dropAfterReply(req, res);
             return;

@@ -305,6 +305,14 @@ for (const PROTO of [1, 2]) {
             check('desktop ending before the head → 200', res.status === 200 && body === 'no-head-body', `${res.status} ${body}`);
         }
         {
+            // A frame with a base64 payload that is not valid base64 must not
+            // take the message handler down: the body keeps coming (Node's
+            // Buffer.from skips the characters outside the alphabet).
+            const res = await fetch(`${base}/api/bad-b64`);
+            const body = await res.text();
+            check('a malformed base64 chunk does not stop the body', res.status === 200 && body === 'helloworld', `${res.status} ${JSON.stringify(body)}`);
+        }
+        {
             const t0 = Date.now();
             const reader = (await fetch(`${base}/api/sse`)).body.getReader();
             let first = 0;

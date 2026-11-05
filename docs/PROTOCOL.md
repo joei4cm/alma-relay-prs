@@ -48,6 +48,13 @@ binary frames and streams request bodies.
 In protocol 2 the desktop may also send `hchunk` and `wmsg` as binary frames,
 and the relay sends phone WebSocket messages that way; see below.
 
+Protocol 1 puts the payload of a request body, and of a binary phone message,
+into one base64 string inside a JSON frame, so the frame has to stay inside
+the 32 MiB an agent frame may take: the base64 of 24 MiB is already 32 MiB
+before the JSON around it. The relay therefore caps a protocol-1 request
+body at 23 MiB — past that the phone gets a `413` — and a protocol-1 binary
+phone message at the same size, closing the socket with `1009`.
+
 When the agent socket closes, the relay fails in-flight requests with `502`
 and closes every bridged phone socket with `1012`, so phones redial instead of
 talking into a dead tunnel.
@@ -117,10 +124,10 @@ paces them to the desktop.
 
 | | Node | Cloudflare |
 | --- | --- | --- |
-| Request body | 128 MB (`MAX_BODY_MB`); protocol 1: 23 MiB — the base64 must fit the 32 MiB agent frame | protocol 1: 23 MB (the base64 must fit the 32 MiB DO message cap); protocol 2: 100 MB (`MAX_BODY_MB`; also your plan's upload limit) |
+| Request body | 128 MB (`MAX_BODY_MB`) | protocol 1: 24 MB (Durable Object WebSocket messages are capped at 32 MiB); protocol 2: 100 MB (`MAX_BODY_MB`; also your plan's upload limit) |
 | Waiting for the response head | 120 s | 120 s |
 | Agent frame | 32 MiB | 32 MiB |
-| Phone WebSocket message | 24 MiB; protocol 1: 23 MiB (base64 in `wmsg`) | 24 MiB; protocol 1: 23 MiB (base64 in `wmsg`) |
+| Phone WebSocket message | 24 MiB | 24 MiB |
 | Phone bytes held before `wopened` | 4 MiB (then close `1009`) | — |
 | Request bodies buffered at once (protocol 1) | 512 MB (`MAX_BUFFERED_MB`, then `503`) | per Durable Object |
 | Un-acknowledged request body (protocol 2) | 4 MiB per request | 4 MiB per request |

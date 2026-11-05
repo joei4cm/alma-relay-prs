@@ -98,6 +98,12 @@ const backend = createServer((req, res) => {
         res.on('close', () => (lastSlowClosed = true));
         return;
     }
+    if (req.url === '/api/bad-b64') {
+        // Asks the desktop to send the body with a base64 payload that is
+        // not valid base64.
+        res.writeHead(200, { 'content-type': 'text/plain', 'x-alma-corrupt-base64': '1' });
+        return res.end('helloworld');
+    }
     if (req.url.startsWith('/api/firehose')) {
         // Streams `mb` MB as fast as the reader takes it, honouring backpressure.
         const total = Number(new URL(req.url, 'http://x').searchParams.get('mb') || 256) * 1024 * 1024;
@@ -295,14 +301,6 @@ for (const PROTO of [1, 2]) {
             check('desktop error before the head → 502', res.status === 502, `status=${res.status}`);
         }
         {
-            // A frame with a base64 payload that is not valid base64 must not
-            // take the message handler down: the body keeps coming (Node's
-            // Buffer.from skips the characters outside the alphabet).
-            const res = await fetch(`${base}/api/bad-b64`);
-            const body = await res.text();
-            check('a malformed base64 chunk does not stop the body', res.status === 200 && body === 'helloworld', `${res.status} ${JSON.stringify(body)}`);
-        }
-        {
             const t0 = Date.now();
             const reader = (await fetch(`${base}/api/sse`)).body.getReader();
             let first = 0;
@@ -357,6 +355,16 @@ for (const PROTO of [1, 2]) {
             await res.body.getReader().read();
             controller.abort();
             check('phone abort cancels the desktop request', await waitFor(() => lastSlowClosed));
+        }
+        if (PROTO === 1) {
+            // A frame with a base64 payload that is not valid base64 must not
+            // take the message handler down: the body keeps coming (Node's
+            // Buffer.from skips the characters outside the alphabet).
+            // Protocol 2 carries the body in a binary frame, so this is a
+            // protocol-1 case.
+            const res = await fetch(`${base}/api/bad-b64`);
+            const body = await res.text();
+            check('a malformed base64 chunk does not stop the body', res.status === 200 && body === 'helloworld', `${res.status} ${JSON.stringify(body)}`);
         }
         {
             const res = await fetch(`${relay.origin}/c/${'x'.repeat(43)}/api/health`);

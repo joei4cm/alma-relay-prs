@@ -221,6 +221,28 @@ export class TunnelDO extends DurableObject {
         this.fcm = undefined;
     }
 
+    /**
+     * The queue lives only in this object's memory: if the DO hibernated
+     * between `wopen` and `wopened`, the frames would be gone (in-memory
+     * state does not survive a wake; a socket attachment holds at most
+     * 16 KiB). A scheduled timer is what keeps a Durable Object awake,
+     * so one runs while any queue has entries. It stops itself once the
+     * last queue is gone.
+     */
+    syncQueueKeepalive() {
+        if (this.preOpenQueues.size > 0 && !this.queueKeepalive) {
+            this.queueKeepalive = setInterval(() => {
+                if (this.preOpenQueues.size === 0) {
+                    clearInterval(this.queueKeepalive);
+                    this.queueKeepalive = null;
+                }
+            }, 60_000);
+        } else if (this.preOpenQueues.size === 0 && this.queueKeepalive) {
+            clearInterval(this.queueKeepalive);
+            this.queueKeepalive = null;
+        }
+    }
+
     fcmSender() {
         if (this.fcm === undefined) {
             try {
@@ -617,7 +639,6 @@ export class TunnelDO extends DurableObject {
                 // in this Durable Object's memory. Cut the phone off instead
                 // of holding on to it (the Node edition closes with 1009).
                 this.preOpenQueues.delete(attachment.id);
-                this.syncQueueKeepalive();
                 const client = this.clientSocket(attachment.id);
                 try {
                     client?.close(1009, 'Too much data before the desktop answered');
@@ -746,13 +767,11 @@ export class TunnelDO extends DurableObject {
             case 'wopened': {
                 const queue = this.preOpenQueues.get(String(frame.id));
                 this.preOpenQueues.delete(String(frame.id));
-                this.syncQueueKeepalive();
                 for (const queued of queue?.frames || []) this.sendWsToAgent(String(frame.id), queued);
                 break;
             }
             case 'werr': {
                 this.preOpenQueues.delete(String(frame.id));
-                this.syncQueueKeepalive();
                 this.closeClientSocket(String(frame.id), 1011, 'Desktop could not open the socket');
                 break;
             }
@@ -769,7 +788,6 @@ export class TunnelDO extends DurableObject {
             }
             case 'wclose': {
                 this.preOpenQueues.delete(String(frame.id));
-                this.syncQueueKeepalive();
                 this.closeClientSocket(String(frame.id), sanitizeCloseCode(frame.code), String(frame.reason || ''));
                 break;
             }
@@ -778,22 +796,6 @@ export class TunnelDO extends DurableObject {
 
     clientSocket(id) {
         return this.ctx.getWebSockets(`c:${id}`)[0] || null;
-    }
-
-    /**
-     * The queue lives only in this object's memory: if the DO hibernated
-     * between `wopen` and `wopened`, the frames would be gone (in-memory
-     * state does not survive a wake; a socket attachment holds at most
-     * 16 KiB). A scheduled timer is what keeps a Durable Object awake,
-     * so one runs while any queue has entries.
-     */
-    syncQueueKeepalive() {
-        if (this.preOpenQueues.size > 0 && !this.queueKeepalive) {
-            this.queueKeepalive = setInterval(() => {}, 60_000);
-        } else if (this.preOpenQueues.size === 0 && this.queueKeepalive) {
-            clearInterval(this.queueKeepalive);
-            this.queueKeepalive = null;
-        }
     }
 
     closeClientSocket(id, code, reason) {
@@ -836,6 +838,8 @@ export class TunnelDO extends DurableObject {
             this.pending.delete(id);
         }
         this.preOpenQueues.clear();
+        // The queues are gone: stop holding the DO awake for them before the
+        // sockets below are closed.
         this.syncQueueKeepalive();
         for (const client of this.ctx.getWebSockets('client')) {
             try {

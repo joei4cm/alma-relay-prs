@@ -669,7 +669,10 @@ export class TunnelDO extends DurableObject {
             case 'hchunk': {
                 const entry = this.pending.get(frame.id);
                 if (!entry) return;
-                entry.enqueue?.(b64decode(frame.b || ''));
+                // Only a base64 string is a body: a malformed frame must not
+                // throw out of the handler (which would reset the tunnel).
+                if (typeof frame.b !== 'string') return;
+                entry.enqueue?.(b64decode(frame.b));
                 break;
             }
             case 'hack': {

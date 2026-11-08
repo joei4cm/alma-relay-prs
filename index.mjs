@@ -733,9 +733,13 @@ function handleAgent(ws) {
                 }
                 break;
             }
-            case 'hchunk':
-                writeResponseBody(agent, frame.id, Buffer.from(frame.b || '', 'base64'));
+            case 'hchunk': {
+                // Only a base64 string is a body. Anything else must not take
+                // the relay down: one bad desktop would drop every phone.
+                if (typeof frame.b !== 'string') break;
+                writeResponseBody(agent, frame.id, Buffer.from(frame.b, 'base64'));
                 break;
+            }
             case 'hack': {
                 agent.http.get(frame.id)?.upload?.refund(Number(frame.n));
                 break;

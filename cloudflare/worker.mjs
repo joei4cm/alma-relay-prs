@@ -25,6 +25,7 @@ import {
     b64decode,
     b64encode,
     bearerOf,
+    closeReason,
     decodeBinary,
     encodeBinary,
     isTokenHash,
@@ -728,7 +729,9 @@ export class TunnelDO extends DurableObject {
             }
             case 'wclose': {
                 this.preOpenQueues.delete(String(frame.id));
-                this.closeClientSocket(String(frame.id), sanitizeCloseCode(frame.code), String(frame.reason || ''));
+                // The reason has to fit in a close frame: a longer one makes
+                // close() throw, and the phone's socket would stay open.
+                this.closeClientSocket(String(frame.id), sanitizeCloseCode(frame.code), closeReason(frame.reason));
                 break;
             }
         }
@@ -753,7 +756,7 @@ export class TunnelDO extends DurableObject {
         // close frame for us, and until we close our end the peer sits in
         // CLOSING until the edge drops the TCP connection (~10 s, code 1006).
         try {
-            ws.close(sanitizeCloseCode(code), String(reason || '').slice(0, 120));
+            ws.close(sanitizeCloseCode(code), closeReason(reason));
         } catch {
             /* already closed */
         }

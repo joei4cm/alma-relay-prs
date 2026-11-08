@@ -729,9 +729,7 @@ export class TunnelDO extends DurableObject {
             }
             case 'wclose': {
                 this.preOpenQueues.delete(String(frame.id));
-                // The reason has to fit in a close frame: a longer one makes
-                // close() throw, and the phone's socket would stay open.
-                this.closeClientSocket(String(frame.id), sanitizeCloseCode(frame.code), closeReason(frame.reason));
+                this.closeClientSocket(String(frame.id), sanitizeCloseCode(frame.code), String(frame.reason || ''));
                 break;
             }
         }
@@ -745,7 +743,9 @@ export class TunnelDO extends DurableObject {
         const client = this.clientSocket(id);
         if (!client) return;
         try {
-            client.close(code, reason);
+            // The reason has to fit in a close frame: a longer one makes
+            // close() throw, and the phone's socket would stay open for good.
+            client.close(code, closeReason(reason));
         } catch {
             /* ignore */
         }

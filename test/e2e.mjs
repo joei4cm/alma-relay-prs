@@ -361,6 +361,30 @@ for (const PROTO of [1, 2]) {
             );
             check('unknown code WebSocket refused', err !== 'opened', err);
         }
+        {
+            // A malformed body frame must be ignored: it must not end up in
+            // the response, and it must not take the relay down — one bad
+            // desktop would otherwise drop every other phone on it.
+            const res = await fetch(`${base}/api/slow`);
+            const reader = res.body.getReader();
+            const first = await reader.read();
+            const id = agent.hreqs.at(-1)?.id;
+            agent.send({ t: 'hchunk', id, b: 123 });
+            agent.send({ t: 'hchunk', id, b: { not: 'base64' } });
+            const extra = await Promise.race([
+                reader.read().then(r => (r.done ? 'eof' : JSON.stringify(Buffer.from(r.value).toString())), e => `error: ${e.message}`),
+                sleep(800 * SLACK).then(() => 'nothing'),
+            ]);
+            const alive = await fetch(`${relay.origin}/healthz`).then(r => r.ok).catch(() => false);
+            const after = await fetch(`${base}/api/health`);
+            check(
+                'a malformed body frame is ignored',
+                extra === 'nothing' && alive && after.status === 200,
+                `extra=${extra} healthz=${alive} status=${after.status}`
+            );
+            check('…and the response stays intact', Buffer.from(first.value || []).toString() === 'data: first\n\n', JSON.stringify(first.value));
+            await reader.cancel().catch(() => {});
+        }
         if (!EXTERNAL) {
             const res = await fetch(`${relay.origin}/turn`, { method: 'POST' });
             check('/turn → 404 when TURN is not configured', res.status === 404, `status=${res.status}`);

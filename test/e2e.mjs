@@ -338,6 +338,17 @@ for (const PROTO of [1, 2]) {
             const closeCode = await Promise.race([ws.closedWith, sleep(2000 * SLACK).then(() => 'open')]);
             check('…and the close handshake completes', closeCode === 1000 || closeCode === 1005, `code=${closeCode} after ${Date.now() - t0}ms`);
         }
+        {
+            // A close reason that does not fit in a close frame must still
+            // close the phone's socket: the reason is cut, not dropped.
+            const ws = await openPhoneSocket(`${wsBase}/ws/echo`);
+            await waitFor(() => agent.sockets.size === 1);
+            const id = [...agent.sockets.keys()][0];
+            agent.send({ t: 'wclose', id, code: 1000, reason: 'é'.repeat(300) });
+            const code = await Promise.race([ws.closedWith, sleep(3000 * SLACK).then(() => 'open')]);
+            check('a long close reason still closes the phone socket', code === 1000 || code === 1005, `code=${code}`);
+            await waitFor(() => agent.sockets.size === 0);
+        }
         if (EDITION === 'cloudflare') {
             // `wrangler dev` fronts workerd with its own proxy, which keeps the
             // upstream request alive after the phone hangs up, so neither the

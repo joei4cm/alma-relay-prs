@@ -31,6 +31,7 @@ import {
     VERSION,
     authorize,
     bearerOf,
+    closeReason,
     decodeBinary,
     encodeBinary,
     isTokenHash,
@@ -794,7 +795,10 @@ function handleAgent(ws) {
                 if (!bridge) return;
                 agent.sockets.delete(frame.id);
                 try {
-                    bridge.client.close(sanitizeCloseCode(frame.code), String(frame.reason || '').slice(0, 120));
+                    // The reason has to fit in a close frame: a longer one
+                    // makes close() throw, and the phone's socket would stay
+                    // open for good.
+                    bridge.client.close(sanitizeCloseCode(frame.code), closeReason(frame.reason));
                 } catch {}
                 break;
             }

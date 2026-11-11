@@ -124,6 +124,13 @@ const backend = createServer((req, res) => {
         res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(bigPayload.length) });
         return res.end(bigPayload);
     }
+    if (req.url.startsWith('/api/onechunk')) {
+        // One body, produced at once: with FakeAgent's `oneChunk` the desktop
+        // answers with a single frame of the whole thing.
+        const total = Number(new URL(req.url, 'http://x').searchParams.get('mb') || 16) * 1024 * 1024;
+        res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(total) });
+        return res.end(Buffer.alloc(total, 5));
+    }
     if (req.url === '/api/early') {
         // Answers without reading the request body.
         res.writeHead(200, { 'content-type': 'text/plain' });
@@ -946,6 +953,101 @@ if (!EXTERNAL || ARGS.includes('--protocol3')) {
         check('suite: protocol 3', false, e.stack);
         if (relay.log) console.log(relay.log());
     } finally {
+        relay.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Suite 8 (Node edition): protocol 3 — one huge frame on a slow phone
+// ---------------------------------------------------------------------------
+if (EDITION === 'node') {
+    // The relay acknowledges a protocol-3 stream when the write to the phone
+    // completes, and cuts a stream that "writes nothing" for STALL_TIMEOUT_S.
+    // One frame larger than the stall window cannot be flushed to a phone
+    // draining slowly within that window, so the watch has to notice the queue
+    // falling instead of waiting for a callback that cannot arrive in time.
+    const STALL_S = 3;
+    const ONE_MB = 16 * 1024 * 1024;
+    // High water above the frame, so this suite is about the stall watch and
+    // not about the agent socket being paused for it.
+    const relay = await startRelay({ STALL_TIMEOUT_S: String(STALL_S), FLOW_HIGH_WATER_MB: '64' });
+    const CODE = newCode();
+    const base = `${relay.origin}/c/${CODE}`;
+    try {
+        const agent = await connected({ relay: relay.origin, code: CODE, proto: 3, oneChunk: true });
+        const slow = await new Promise((resolve, reject) =>
+            httpGet(`${base}/api/onechunk?mb=16`, { agent: false }, res => (res.pause(), resolve(res))).on('error', reject)
+        );
+        const howDone = new Promise(r => {
+            slow.on('end', () => r('end'));
+            slow.on('aborted', () => r('aborted'));
+            slow.on('error', () => r('error'));
+            slow.on('close', () => r('close'));
+        });
+        let received = 0;
+        // Drain at ~1.5 MB/s: the single 16 MB write needs several seconds to
+        // flush — more than STALL_TIMEOUT_S — with the queue falling all along.
+        const deadline = Date.now() + 60000 * SLACK;
+        while (received < ONE_MB && !slow.destroyed && Date.now() < deadline) {
+            let chunk;
+            while ((chunk = slow.read(96 * 1024))) received += chunk.length;
+            await sleep(64);
+        }
+        slow.on('data', c => (received += c.length));
+        slow.resume();
+        const how = await Promise.race([howDone, sleep(20000 * SLACK).then(() => 'hung')]);
+        check('one huge frame on a slow phone is not cut off', how === 'end' && received === ONE_MB, `${how} received=${(received / 1048576).toFixed(1)} MB`);
+        check('…and the cut is not logged', !/wrote nothing/.test(relay.log()), relay.log());
+        const after = await fetch(`${base}/api/health`);
+        check('…and the tunnel still works', after.status === 200, `${after.status}`);
+        agent.close();
+    } catch (e) {
+        check('suite: one huge frame', false, e.stack);
+        if (relay.log) console.log(relay.log());
+    } finally {
+        relay.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Suite 9 (Node edition): protocol 3 — a slow phone never freezes the desktop
+// ---------------------------------------------------------------------------
+if (EDITION === 'node') {
+    // A protocol-3 desktop may push its whole window into one stream. The
+    // safety net that pauses the whole agent socket has to sit above that
+    // window: below it, a phone that is merely slow stops every other stream
+    // on the desktop — and raising FLOW_STREAM_WINDOW_KB, the obvious thing
+    // to try on a high-RTT link, makes it certain.
+    const relay = await startRelay({ STALL_TIMEOUT_S: '20', FLOW_HIGH_WATER_MB: '1', FLOW_STREAM_WINDOW_KB: '16384' });
+    const CODE = newCode();
+    const base = `${relay.origin}/c/${CODE}`;
+    let stuck = null;
+    try {
+        const agent = await connected({ relay: relay.origin, code: CODE, proto: 3 });
+        check('the relay offers the raised window', agent.registered.window === 16 * 1024 * 1024, JSON.stringify(agent.registered));
+        stuck = await new Promise((resolve, reject) =>
+            httpGet(`${base}/api/firehose?mb=64`, { agent: false }, res => (res.pause(), resolve(res))).on('error', reject)
+        );
+        // Wait until the desktop has pushed its window and stopped.
+        let before = -Infinity;
+        for (let i = 0; i < 30 && firehose.written - before > MB_; i++) {
+            before = firehose.written;
+            await sleep(500);
+        }
+        await sleep(500);
+        const raced = await Promise.race([
+            fetch(`${base}/api/health`).then(r => r.status, e => `error:${e.message}`),
+            sleep(3000 * SLACK).then(() => 'timeout'),
+        ]);
+        check('the desktop is held back on that stream', agent.waiting.size === 1, `waiting=${agent.waiting.size} written=${(firehose.written / MB_).toFixed(1)} MB`);
+        check('another request on the same desktop still answers', raced === 200, String(raced));
+        check('the agent socket was never paused', !/not reading it/.test(relay.log()), relay.log());
+        agent.close();
+    } catch (e) {
+        check('suite: a slow phone never freezes the desktop', false, e.stack);
+        if (relay.log) console.log(relay.log());
+    } finally {
+        stuck?.destroy();
         relay.stop();
     }
 }

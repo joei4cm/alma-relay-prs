@@ -84,6 +84,28 @@ const OPEN_QUEUE_MAX = 4 * MB; // phone bytes held while the desktop opens its s
 const HIGH_WATER = (limit(env.FLOW_HIGH_WATER_MB, 8) || 8) * MB;
 const LOW_WATER = Math.min((limit(env.FLOW_LOW_WATER_MB, 1) || 1) * MB, HIGH_WATER / 2);
 const FLOW_TICK_MS = 25;
+/**
+ * Bytes queued on one stream before the whole agent socket is paused.
+ * A protocol-3 desktop stops at the window it was offered, but the frame that
+ * crosses the line overshoots that, so the safety net has to sit above the
+ * window: pausing below it would freeze every other stream on the desktop for
+ * a phone that is merely slow (and raising `FLOW_STREAM_WINDOW_KB` — the
+ * obvious thing to try on a high-RTT link — would make it permanent).
+ */
+const pauseHigh = agent => (agent.proto >= 3 ? Math.max(HIGH_WATER, STREAM_WINDOW * 2) : HIGH_WATER);
+/**
+ * Bytes a sink has handed to the kernel but not had accepted yet, or -1 when
+ * the runtime does not expose it (the watches then fall back to the write
+ * callback alone). `writableLength` only moves when a whole `write` completes,
+ * so one frame larger than what the phone takes in STALL_TIMEOUT_S looks
+ * motionless to every watch built on it — while every byte of it is leaving.
+ * This falls as the peer reads, which is what separates "slow" from "stuck"
+ * for a large frame.
+ */
+function queuedFor(socket) {
+    const q = socket?._handle?.writeQueueSize;
+    return Number.isFinite(q) ? q : -1;
+}
 // How many stall windows an upload may sit out while the relay itself holds
 // the agent socket (a slow phone download) before it is failed anyway.
 const MAX_DEFERRALS = 5;
@@ -212,10 +234,11 @@ class Agent {
         this.flowTimer = null;
         // Protocol 3: each stream is acknowledged as its bytes leave for the
         // phone, so the desktop holds back only the stream of a slow phone
-        // and the agent socket is never paused for it (`congested` stays as
-        // a safety net for a desktop that ignores its window).
+        // and the agent socket is not paused for it (`congested` stays as a
+        // safety net for a desktop that ignores its window, and sits above
+        // the window so it never fires on a conforming one).
         this.acks = proto >= 3 ? new AckBatcher((id, n) => this.send({ t: 'ack', id, n })) : null;
-        /** key -> {n, since, gone, kill}: protocol-3 bytes handed to a phone sink, not yet written out */
+        /** key -> {n, since, last, gone, progress, kill}: protocol-3 bytes handed to a phone sink, not yet written out */
         this.owed = new Map();
         this.stallTimer = null;
     }
@@ -225,12 +248,17 @@ class Agent {
      * Returns the write callback that acknowledges them to the desktop once
      * they are written out (undefined below protocol 3). A sink that writes
      * none of what it owes for STALL_MS is cut off with `kill()`.
+     * `progress()` is the sink's bytes still on their way to the kernel (or -1
+     * once it is gone): a counter that keeps falling means the phone is taking
+     * data, so a stream is not stalled even though a single large frame has
+     * not finished writing yet.
      */
-    deliver(id, key, n, gone, kill) {
+    deliver(id, key, n, gone, progress, kill) {
         if (!this.acks) return undefined;
         let debt = this.owed.get(key);
         if (!debt) {
-            debt = { n: 0, since: Date.now(), gone, kill };
+            // `last` starts at Infinity so the first check counts as progress.
+            debt = { n: 0, since: Date.now(), last: Infinity, gone, progress, kill };
             this.owed.set(key, debt);
             if (STALL_MS && !this.stallTimer) this.stallTimer = setInterval(() => this.checkStalls(), Math.min(1000, STALL_MS / 2));
         }
@@ -250,7 +278,19 @@ class Agent {
         for (const [key, debt] of this.owed) {
             if (debt.gone()) {
                 this.owed.delete(key);
-            } else if (now - debt.since > STALL_MS) {
+                continue;
+            }
+            const moved = debt.progress();
+            if (moved >= 0) {
+                // Bytes left the sink since the last check: the stream is
+                // moving. Without this a phone draining one huge frame for
+                // longer than STALL_MS is cut off mid-transfer, because the
+                // write it is waiting on cannot complete until the frame is
+                // entirely out.
+                if (moved < debt.last) debt.since = now;
+                debt.last = moved;
+            }
+            if (now - debt.since > STALL_MS) {
                 console.log(`[relay] agent ${this.tag}: ${key} wrote nothing for ${STALL_MS / 1000}s with ${mb(debt.n)} owed; cut off`);
                 this.owed.delete(key);
                 try {
@@ -304,16 +344,19 @@ class Agent {
     }
 
     /**
-     * A phone sink has more than HIGH_WATER bytes queued. `level()` returns
-     * its buffered bytes, or -1 once it is gone; `kill()` cuts it off when it
-     * drains nothing for STALL_MS.
+     * A phone sink has more than `high` bytes queued. `level()` returns
+     * its buffered bytes, or -1 once it is gone; `progress()` returns the
+     * bytes still on their way to the kernel — the counter that keeps falling
+     * while a large frame leaves for a slow phone, when `level()` cannot move
+     * until a whole write completes. `kill()` cuts it off when it drains
+     * nothing for STALL_MS.
      */
-    congested(key, level, kill) {
-        if (!this.sinks.has(key)) this.sinks.set(key, { level, kill, last: level(), since: Date.now() });
+    congested(key, level, kill, high = HIGH_WATER, progress = level) {
+        if (!this.sinks.has(key)) this.sinks.set(key, { level, progress, kill, last: level(), moved: progress(), since: Date.now() });
         if (!this.paused) {
             this.paused = true;
             this.ws.pause();
-            this.pause = { since: Date.now(), ponged: 0, key, bytes: level(), logged: false };
+            this.pause = { since: Date.now(), ponged: 0, key, bytes: level(), logged: false, high };
             this.keepAlive(this.pause.since);
         }
         this.startFlow();
@@ -337,10 +380,18 @@ class Agent {
             const level = sink.level();
             if (level < LOW_WATER) {
                 this.sinks.delete(key);
-            } else if (level < sink.last) {
-                sink.last = level;
-                sink.since = now;
-            } else if (STALL_MS && now - sink.since > STALL_MS) {
+                continue;
+            }
+            // Either the sink's own queue shrank, or its bytes reached the
+            // kernel: both mean the phone is taking data. `level` alone cannot
+            // move until a whole write completes, so one large frame for a
+            // slow phone would otherwise look stalled the whole time.
+            const moved = sink.progress();
+            const moving = moved < sink.moved || level < sink.last;
+            sink.moved = moved;
+            sink.last = level;
+            if (moving) sink.since = now;
+            else if (STALL_MS && now - sink.since > STALL_MS) {
                 console.log(`[relay] agent ${this.tag}: ${key} drained nothing for ${STALL_MS / 1000}s with ${mb(level)} queued; cut off`);
                 this.sinks.delete(key);
                 try {
@@ -358,7 +409,7 @@ class Agent {
             this.keepAlive(now);
             if (!this.pause.logged && now - this.pause.since >= PAUSE_LOG_MS) {
                 this.pause.logged = true;
-                console.log(`[relay] agent ${this.tag}: not reading it, ${this.pause.key} has ${mb(this.pause.bytes)} queued for the phone (over ${mb(HIGH_WATER)})`);
+                console.log(`[relay] agent ${this.tag}: not reading it, ${this.pause.key} has ${mb(this.pause.bytes)} queued for the phone (over ${mb(this.pause.high)})`);
             }
         }
         if (this.waiting.size && (this.ws.bufferedAmount < LOW_WATER || this.ws.readyState !== WebSocket.OPEN)) {
@@ -972,17 +1023,20 @@ function writeResponseBody(agent, id, bytes) {
     const entry = agent.http.get(id);
     if (!entry) return;
     const { res } = entry;
+    const level = () => (res.destroyed ? -1 : res.writableLength);
+    const progress = () => (res.destroyed ? -1 : queuedFor(res.socket));
     const kill = () => {
         agent.http.delete(id);
         agent.send({ t: 'hcancel', id });
         res.destroy();
     };
-    const written = agent.deliver(id, `h:${id}`, bytes.length, () => res.destroyed, kill);
+    const written = agent.deliver(id, `h:${id}`, bytes.length, () => res.destroyed, progress, kill);
     try {
         res.write(bytes, written);
     } catch {}
-    if (res.writableLength > HIGH_WATER) {
-        agent.congested(`h:${id}`, () => (res.destroyed ? -1 : res.writableLength), kill);
+    const high = pauseHigh(agent);
+    if (res.writableLength > high) {
+        agent.congested(`h:${id}`, level, kill, high, progress);
     }
 }
 
@@ -991,12 +1045,15 @@ function sendToPhone(agent, id, data, isBinary) {
     const bridge = agent.sockets.get(id);
     if (!bridge || bridge.client.readyState !== WebSocket.OPEN) return;
     const { client } = bridge;
+    const level = () => (client.readyState === WebSocket.OPEN ? client.bufferedAmount : -1);
+    const progress = () => (client.readyState === WebSocket.OPEN ? queuedFor(client._socket) : -1);
     const kill = () => client.terminate(); // its close handler tells the desktop
     const size = typeof data === 'string' ? Buffer.byteLength(data) : data.length;
-    const sent = agent.deliver(id, `w:${id}`, size, () => client.readyState !== WebSocket.OPEN, kill);
+    const sent = agent.deliver(id, `w:${id}`, size, () => client.readyState !== WebSocket.OPEN, progress, kill);
     client.send(data, { binary: isBinary }, sent);
-    if (client.bufferedAmount > HIGH_WATER) {
-        agent.congested(`w:${id}`, () => (client.readyState === WebSocket.OPEN ? client.bufferedAmount : -1), kill);
+    const high = pauseHigh(agent);
+    if (client.bufferedAmount > high) {
+        agent.congested(`w:${id}`, level, kill, high, progress);
     }
 }
 

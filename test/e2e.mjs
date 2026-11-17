@@ -421,6 +421,11 @@ for (const PROTO of [1, 2, 3]) {
             check('the desktop failing its side closes the phone', phoneCode === 1011, String(phoneCode));
             const echo = agent.wcloses.slice(before).filter(w => w.id === id);
             check('…and is not told about it again', echo.length === 0, `id=${id} ${JSON.stringify(agent.wcloses.slice(before))}`);
+            // The relay forgot that bridge, so nobody tells the desktop the
+            // phone is gone: its own socket would stay in the map for good and
+            // the next test would take its id for a live one.
+            agent.sockets.get(id)?.close();
+            await waitFor(() => agent.sockets.size === 0);
         }
         if (EDITION === 'cloudflare') {
             // `wrangler dev` fronts workerd with its own proxy, which keeps the

@@ -283,4 +283,10 @@ export class FakeAgent {
     close() {
         this.ws?.close();
     }
+
+    /** Kill the connection with no close frame: the relay sees 1006, the
+     * abrupt death a flaky path produces. */
+    drop() {
+        this.ws?.terminate();
+    }
 }

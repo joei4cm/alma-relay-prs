@@ -52,18 +52,21 @@ When the agent socket closes, the relay fails in-flight requests with `502`
 and closes every bridged phone socket with `1012`, so phones redial instead of
 talking into a dead tunnel.
 
-The Cloudflare edition holds bridged phone sockets for
-`AGENT_RECONNECT_GRACE_S` seconds (default `10`; `0` restores the behaviour
-above) before closing them with `1012`: a desktop whose connection blipped
-usually redials within that window, and the relay re-sends `wopen` for each
-still-open phone socket on the new connection, so the phone's WebSocket
-survives the desktop's reconnect. Phone frames sent while no desktop is
-connected queue as before `wopened` (same 4 MiB cap) and are flushed once the
-new connection answers `wopened`; sockets the phone opens during the window
-are held the same way. Only when the grace expires without a redial are the
-phones closed with `1012`. A desktop must treat each `wopen` as
-self-contained: after a redial the relay re-uses a socket id on a fresh
-connection, whose local side is to be opened anew.
+The Cloudflare edition distinguishes how the connection ended. One that died
+without a close frame (`1006` — the network path blipped) is worth waiting
+out: the desktop usually redials within seconds, so the relay holds the
+bridged phone sockets for `AGENT_RECONNECT_GRACE_S` seconds (default `10`)
+and re-sends `wopen` for each still-open one on the new connection, so the
+phone's WebSocket survives the desktop's reconnect. Phone frames sent while
+no desktop is connected queue as before `wopened` (same 4 MiB cap) and are
+flushed once the new connection answers `wopened`; sockets the phone opens
+during the window are held the same way. Only when the grace expires without
+a redial are the phones closed with `1012`. A desktop that closed its socket
+deliberately (`1000`) has left on purpose: the relay closes the phones at
+once, as above (`AGENT_RECONNECT_GRACE_S=0` makes every close behave that
+way). A desktop must treat each `wopen` as self-contained: after a redial the
+relay re-uses a socket id on a fresh connection, whose local side is to be
+opened anew.
 
 ## Protocol 2
 

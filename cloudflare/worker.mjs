@@ -59,6 +59,11 @@ const stallMs = env => limit(env.STALL_TIMEOUT_S, 60) * 1000;
 // How long bridged phone sockets are held open after the agent socket dies,
 // waiting for the desktop to redial (see agentDown). 0 = close them at once.
 const agentGraceMs = env => limit(env.AGENT_RECONNECT_GRACE_S, 10) * 1000;
+// A close the desktop asked for (1000 normal, 1001 going away) means it is
+// gone on purpose and will not redial by itself. A connection that died
+// without a close frame (1006 — the proxy path is the common case) is worth
+// waiting for: the desktop redials within seconds.
+const deliberateClose = code => code === 1000 || code === 1001;
 const relayProtocol = env => negotiateProtocol(env.RELAY_PROTOCOL || PROTOCOL);
 const COALESCE_MS = 10;
 const TIMEOUT = Symbol('timeout');
@@ -904,9 +909,11 @@ export class TunnelDO extends DurableObject {
         const attachment = ws.deserializeAttachment() || {};
         if (attachment.role === 'agent' && attachment.registered) {
             // Desktop went away: fail in-flight requests, then hold the
-            // bridged sockets for a redial (or drop them at once with
-            // AGENT_RECONNECT_GRACE_S=0).
-            this.agentDown('Desktop disconnected');
+            // bridged sockets for a redial — but only if the connection died
+            // rather than being closed on purpose; a deliberate close means
+            // the desktop is gone (AGENT_RECONNECT_GRACE_S=0 closes them at
+            // once either way).
+            this.agentDown('Desktop disconnected', { hold: !deliberateClose(code) });
         } else if (attachment.role === 'client') {
             this.preOpenQueues.delete(attachment.id);
             this.syncQueueKeepalive();
@@ -933,10 +940,12 @@ export class TunnelDO extends DurableObject {
      * queue exactly like pre-`wopen` ones, and rebindClients() pairs them
      * with the redialled agent. If it does not come back within
      * AGENT_RECONNECT_GRACE_S, dropTunnels() closes the phones with 1012.
+     * `hold: false` is a deliberate close (1000): the desktop left on
+     * purpose, so the phones are dropped at once, like the Node edition.
      */
-    agentDown(reason) {
+    agentDown(reason, { hold = true } = {}) {
         this.failPending('Desktop disconnected from relay');
-        const grace = agentGraceMs(this.env);
+        const grace = hold ? agentGraceMs(this.env) : 0;
         if (!grace) return this.dropTunnels(reason);
         for (const client of this.ctx.getWebSockets('client')) {
             const att = client.deserializeAttachment() || {};

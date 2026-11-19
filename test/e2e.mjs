@@ -278,7 +278,8 @@ for (const PROTO of [1, 2, 3]) {
     console.log(`  — protocol ${PROTO} desktop`);
     const offer = PROTO >= 2 ? PROTO : undefined;
     // The Cloudflare edition holds phone sockets for a grace period when the
-    // desktop drops; short here so the drop assertions below land in time.
+    // desktop's connection dies abruptly, and through a replacement register;
+    // short here so the assertions below land in time.
     const relay = await startRelay(EDITION === 'cloudflare' ? { AGENT_RECONNECT_GRACE_S: '1' } : {});
     const CODE = newCode();
     const base = `${relay.origin}/c/${CODE}`;
@@ -534,7 +535,7 @@ if (EDITION === 'cloudflare') {
         ws.send('before');
         check('echo before the drop', await waitFor(() => ws.messages.includes('before')));
 
-        agent.close();
+        agent.drop(); // no close frame: the relay sees 1006, the blip case
         await sleep(600);
         check('a dropped desktop does not close the phone socket at once', ws.readyState === WebSocket.OPEN, `state=${ws.readyState}`);
         const gap = await fetch(`${base}/api/health`).catch(e => ({ status: String(e) }));
@@ -554,13 +555,41 @@ if (EDITION === 'cloudflare') {
         // A socket the relay accepted while no desktop was connected is, under
         // wrangler dev's local proxy, held in CLOSING for ~10 s after the close
         // handshake before its TCP end lands — wait past that.
-        agent2.close();
+        agent2.drop();
         const codes = await Promise.all([ws, held].map(s => Promise.race([s.closedWith, sleep(25_000).then(() => 'open')])));
         check('grace expiry closes the held phone sockets', codes.every(c => c === 1012), JSON.stringify(codes));
         const after = await fetch(`${base}/api/health`);
         check('…and later requests get 502', after.status === 502, String(after.status));
     } catch (e) {
         check('suite: reconnect grace', false, e.stack);
+        if (relay.log) console.log(relay.log());
+    } finally {
+        relay.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Suite 1.6 (Cloudflare edition): a desktop that closes its socket cleanly
+// (1000) has left on purpose — the phones are dropped at once, no grace
+// ---------------------------------------------------------------------------
+if (EDITION === 'cloudflare') {
+    const relay = await startRelay({ AGENT_RECONNECT_GRACE_S: '5' });
+    try {
+        const CODE = newCode();
+        const wsBase = `${relay.origin}/c/${CODE}`.replace(/^http/, 'ws');
+        const agent = await connected({ relay: relay.origin, code: CODE, proto: 3 });
+        const ws = await openPhoneSocket(`${wsBase}/ws/echo`);
+        ws.send('before');
+        check('echo before the clean close', await waitFor(() => ws.messages.includes('before')));
+
+        agent.close(); // a close frame: the desktop quit, not the path dying
+        // Under the grace this socket would live the full 5 s; it must not.
+        const code = await Promise.race([ws.closedWith, sleep(3000 * SLACK).then(() => 'open')]);
+        check('a clean desktop close drops the phone socket at once', code === 1012, String(code));
+        const after = await fetch(`${relay.origin}/c/${CODE}/api/health`);
+        check('…and later requests get 502', after.status === 502, String(after.status));
+    } catch (e) {
+        check('suite: clean close needs no grace', false, e.stack);
         if (relay.log) console.log(relay.log());
     } finally {
         relay.stop();

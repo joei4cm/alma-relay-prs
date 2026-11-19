@@ -277,7 +277,9 @@ console.log(`[e2e] edition: ${EDITION}`);
 for (const PROTO of [1, 2, 3]) {
     console.log(`  — protocol ${PROTO} desktop`);
     const offer = PROTO >= 2 ? PROTO : undefined;
-    const relay = await startRelay();
+    // The Cloudflare edition holds phone sockets for a grace period when the
+    // desktop drops; short here so the drop assertions below land in time.
+    const relay = await startRelay(EDITION === 'cloudflare' ? { AGENT_RECONNECT_GRACE_S: '1' } : {});
     const CODE = newCode();
     const base = `${relay.origin}/c/${CODE}`;
     const wsBase = base.replace(/^http/, 'ws');
@@ -480,15 +482,26 @@ for (const PROTO of [1, 2, 3]) {
         }
         {
             // A newer desktop with the same code takes over; the old one is
-            // told so and phone sockets bridged through it are dropped.
+            // told so. The Node edition drops the phones it was bridging;
+            // the Cloudflare edition re-bridges them to the newcomer.
             const ws = await openPhoneSocket(`${wsBase}/ws/echo`);
             await waitFor(() => agent.sockets.size === 1);
             const agent2 = await connected({ relay: relay.origin, code: CODE, proto: offer });
             const oldClosed = await waitFor(() => agent.closed);
-            const phoneCode = await Promise.race([ws.closedWith, sleep(3000 * SLACK).then(() => 'open')]);
             const res = await fetch(`${base}/api/health`);
             check('newer desktop replaces the older one', oldClosed && agent.closed.code === 4000 && res.status === 200, JSON.stringify(agent.closed));
-            check('…and bridged phone sockets are dropped', phoneCode === 1012, String(phoneCode));
+            if (EDITION === 'cloudflare') {
+                check(
+                    'bridged phone socket survives the replacement',
+                    ws.readyState === WebSocket.OPEN && (await waitFor(() => agent2.sockets.size === 1)),
+                    `phone ${ws.readyState} desktop ${JSON.stringify([...agent2.sockets.keys()])}`
+                );
+                ws.send('after-swap');
+                check('…and is re-bridged to the new desktop', await waitFor(() => ws.messages.includes('after-swap'), 3000), JSON.stringify(ws.messages));
+            } else {
+                const phoneCode = await Promise.race([ws.closedWith, sleep(3000 * SLACK).then(() => 'open')]);
+                check('…and bridged phone sockets are dropped', phoneCode === 1012, String(phoneCode));
+            }
 
             const ws2 = await openPhoneSocket(`${wsBase}/ws/echo`);
             agent2.close();
@@ -500,6 +513,54 @@ for (const PROTO of [1, 2, 3]) {
         }
     } catch (e) {
         check(`suite: open relay (protocol ${PROTO})`, false, e.stack);
+        if (relay.log) console.log(relay.log());
+    } finally {
+        relay.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Suite 1.5 (Cloudflare edition): the desktop's connection blips — bridged
+// phone sockets are held through the grace window and re-bridged on redial
+// ---------------------------------------------------------------------------
+if (EDITION === 'cloudflare') {
+    const relay = await startRelay({ AGENT_RECONNECT_GRACE_S: '3' });
+    try {
+        const CODE = newCode();
+        const base = `${relay.origin}/c/${CODE}`;
+        const wsBase = base.replace(/^http/, 'ws');
+        const agent = await connected({ relay: relay.origin, code: CODE, proto: 3 });
+        const ws = await openPhoneSocket(`${wsBase}/ws/echo`);
+        ws.send('before');
+        check('echo before the drop', await waitFor(() => ws.messages.includes('before')));
+
+        agent.close();
+        await sleep(600);
+        check('a dropped desktop does not close the phone socket at once', ws.readyState === WebSocket.OPEN, `state=${ws.readyState}`);
+        const gap = await fetch(`${base}/api/health`).catch(e => ({ status: String(e) }));
+        check('…and HTTP during the gap gets 502', gap.status === 502, String(gap.status));
+        ws.send('during-gap');
+        const held = await openPhoneSocket(`${wsBase}/ws/hello`);
+        check('a phone socket opened during the gap is held, not refused', held.readyState === WebSocket.OPEN, `state=${held.readyState}`);
+
+        const agent2 = await connected({ relay: relay.origin, code: CODE, proto: 3 });
+        check(
+            'the redialled desktop re-bridges both phone sockets',
+            await waitFor(() => held.messages.includes('hello-from-desktop') && ws.messages.includes('during-gap'), 4000),
+            JSON.stringify({ held: held.messages, ws: ws.messages })
+        );
+
+        // No redial this time: once the grace expires the phones are told 1012.
+        // A socket the relay accepted while no desktop was connected is, under
+        // wrangler dev's local proxy, held in CLOSING for ~10 s after the close
+        // handshake before its TCP end lands — wait past that.
+        agent2.close();
+        const codes = await Promise.all([ws, held].map(s => Promise.race([s.closedWith, sleep(25_000).then(() => 'open')])));
+        check('grace expiry closes the held phone sockets', codes.every(c => c === 1012), JSON.stringify(codes));
+        const after = await fetch(`${base}/api/health`);
+        check('…and later requests get 502', after.status === 502, String(after.status));
+    } catch (e) {
+        check('suite: reconnect grace', false, e.stack);
         if (relay.log) console.log(relay.log());
     } finally {
         relay.stop();

@@ -56,6 +56,9 @@ const limit = (value, fallback) => {
 // message size.
 const streamMaxBody = env => limit(env.MAX_BODY_MB, 100) * MB || Infinity;
 const stallMs = env => limit(env.STALL_TIMEOUT_S, 60) * 1000;
+// How long bridged phone sockets are held open after the agent socket dies,
+// waiting for the desktop to redial (see agentDown). 0 = close them at once.
+const agentGraceMs = env => limit(env.AGENT_RECONNECT_GRACE_S, 10) * 1000;
 const relayProtocol = env => negotiateProtocol(env.RELAY_PROTOCOL || PROTOCOL);
 const COALESCE_MS = 10;
 const TIMEOUT = Symbol('timeout');
@@ -213,6 +216,7 @@ export class TunnelDO extends DurableObject {
         this.pending = new Map(); // id -> {enqueue, close, fail, headResolve, timer, headersSent}
         this.preOpenQueues = new Map(); // client ws id -> {frames, bytes} queued until agent sends wopened
         this.queueKeepalive = null; // timer holding the DO awake while the queue has entries
+        this.agentGraceTimer = null; // armed while phone sockets wait for the desktop to redial
         this.counter = 0;
         // Protocol 3: response body / WebSocket bytes acknowledged per stream.
         this.acks = new AckBatcher((id, n) => this.sendToAgent({ t: 'ack', id, n }));
@@ -370,17 +374,21 @@ export class TunnelDO extends DurableObject {
 
     acceptClientSocket(request) {
         const agent = this.agentSocket();
-        if (!agent) return offline();
+        // No desktop — but one may be mid-redial inside the grace window.
+        // Hold the socket (queued like any pre-wopen phone) and bridge it
+        // when the desktop registers; without the grace it is refused now.
+        if (!agent && !this.agentGraceTimer) return offline();
 
         const url = new URL(request.url);
         const id = this.nextId('w');
         const pair = new WebSocketPair();
         const [client, server] = Object.values(pair);
         this.ctx.acceptWebSocket(server, ['client', `c:${id}`]);
-        server.serializeAttachment({ role: 'client', id });
+        // `path` is what a redialled desktop is re-sent (rebindClients).
+        server.serializeAttachment({ role: 'client', id, path: url.pathname + url.search });
         this.preOpenQueues.set(id, { frames: [], bytes: 0 });
         this.syncQueueKeepalive();
-        this.sendToAgent({ t: 'wopen', id, path: url.pathname + url.search });
+        if (agent) this.sendToAgent({ t: 'wopen', id, path: url.pathname + url.search });
         return new Response(null, { status: 101, webSocket: client });
     }
 
@@ -751,15 +759,16 @@ export class TunnelDO extends DurableObject {
                 }
             }
             // Every bridged phone socket was paired with a responder on the
-            // previous agent connection, which the desktop has torn down. Left
-            // open, the phone keeps sending into a socket id the new agent has
-            // never heard of: the edge still answers its pings, so it never
-            // redials, and every request times out (Node edition: Agent.destroy).
-            if (replaced) this.dropTunnels('Desktop reconnected');
+            // previous agent connection, which the desktop has torn down.
+            // Instead of closing the phones (which they read as "reconnect"),
+            // hold them for the grace window and re-bridge them to this
+            // agent below (Node edition: Agent.destroy closes them at once).
+            if (replaced) this.agentDown('Desktop reconnected');
             const proto = negotiateProtocol(frame.proto, relayProtocol(this.env));
             ws.serializeAttachment({ role: 'agent', registered: true, account, proto });
             ws.send(JSON.stringify({ t: 'registered', proto, ...(proto >= 3 ? { window: streamWindow(this.env.FLOW_STREAM_WINDOW_KB) } : {}) }));
             if (account) console.log(`[relay] agent registered for account ${account}`);
+            this.rebindClients();
             return;
         }
 
@@ -876,7 +885,8 @@ export class TunnelDO extends DurableObject {
         const client = this.clientSocket(id);
         if (!client) return;
         try {
-            client.serializeAttachment({ role: 'client', id, agentClosed: true });
+            // Keep `path`: the attachment is replaced wholesale.
+            client.serializeAttachment({ ...client.deserializeAttachment(), agentClosed: true });
         } catch {
             /* gone */
         }
@@ -893,8 +903,10 @@ export class TunnelDO extends DurableObject {
         }
         const attachment = ws.deserializeAttachment() || {};
         if (attachment.role === 'agent' && attachment.registered) {
-            // Desktop went away: fail in-flight requests, drop bridged sockets.
-            this.dropTunnels('Desktop disconnected');
+            // Desktop went away: fail in-flight requests, then hold the
+            // bridged sockets for a redial (or drop them at once with
+            // AGENT_RECONNECT_GRACE_S=0).
+            this.agentDown('Desktop disconnected');
         } else if (attachment.role === 'client') {
             this.preOpenQueues.delete(attachment.id);
             this.syncQueueKeepalive();
@@ -902,15 +914,73 @@ export class TunnelDO extends DurableObject {
         }
     }
 
-    /** Fail in-flight requests and close every bridged phone socket. */
-    dropTunnels(reason) {
+    /** Fail every in-flight HTTP request with 502 (it cannot survive a redial). */
+    failPending(message) {
         for (const [id, entry] of this.pending) {
             clearTimeout(entry.timer);
             entry.wake?.();
-            if (!entry.headersSent) entry.headResolve?.({ status: 502, error: true, message: 'Desktop disconnected from relay' });
-            else entry.fail?.('Desktop disconnected from relay');
+            if (!entry.headersSent) entry.headResolve?.({ status: 502, error: true, message });
+            else entry.fail?.(message);
             this.pending.delete(id);
         }
+    }
+
+    /**
+     * The agent socket is gone. In-flight HTTP dies with it — the request
+     * body was already handed to the old connection — but a desktop whose
+     * network path blipped (1006 through a proxy is the common case) redials
+     * within seconds, so bridged phone WebSockets are held: their frames
+     * queue exactly like pre-`wopen` ones, and rebindClients() pairs them
+     * with the redialled agent. If it does not come back within
+     * AGENT_RECONNECT_GRACE_S, dropTunnels() closes the phones with 1012.
+     */
+    agentDown(reason) {
+        this.failPending('Desktop disconnected from relay');
+        const grace = agentGraceMs(this.env);
+        if (!grace) return this.dropTunnels(reason);
+        for (const client of this.ctx.getWebSockets('client')) {
+            const att = client.deserializeAttachment() || {};
+            // `path` missing: never wopen-able. agentClosed: the desktop
+            // itself ended this socket; the phone is being closed anyway.
+            if (att.role !== 'client' || att.path === undefined || att.agentClosed) continue;
+            // Keep an existing queue (frames sent since the drop, or since
+            // the wopen): agentDown can run twice for one redial — the close
+            // event first, then the replacement path of the new register.
+            if (!this.preOpenQueues.has(att.id)) this.preOpenQueues.set(att.id, { frames: [], bytes: 0 });
+        }
+        this.syncQueueKeepalive();
+        // Protocol-3 acks owed to the old connection would inflate the next
+        // agent's per-stream counts: its streams start at zero.
+        this.acks.clear();
+        clearTimeout(this.agentGraceTimer);
+        // The timer is what keeps this Durable Object awake to deliver the
+        // drop (see syncQueueKeepalive).
+        this.agentGraceTimer = setTimeout(() => {
+            this.agentGraceTimer = null;
+            this.dropTunnels(reason);
+        }, grace);
+    }
+
+    /** A registered agent: re-send `wopen` for every phone socket waiting on one. */
+    rebindClients() {
+        clearTimeout(this.agentGraceTimer);
+        this.agentGraceTimer = null;
+        if (this.preOpenQueues.size === 0) return;
+        for (const id of [...this.preOpenQueues.keys()]) {
+            const client = this.clientSocket(id);
+            const att = client?.deserializeAttachment() || {};
+            if (!client || att.role !== 'client' || att.agentClosed) {
+                this.preOpenQueues.delete(id);
+                continue;
+            }
+            this.sendToAgent({ t: 'wopen', id, path: att.path });
+        }
+        this.syncQueueKeepalive();
+    }
+
+    /** Fail in-flight requests and close every bridged phone socket. */
+    dropTunnels(reason) {
+        this.failPending('Desktop disconnected from relay');
         this.preOpenQueues.clear();
         // The queues are gone: stop holding the DO awake for them before the
         // sockets below are closed.

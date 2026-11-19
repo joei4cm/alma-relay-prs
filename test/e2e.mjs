@@ -416,6 +416,42 @@ for (const PROTO of [1, 2, 3]) {
 }
 
 // ---------------------------------------------------------------------------
+// Suite 1.7 (both editions): the two silent ways a desktop ends a response
+// are logged — a short hend and a herr after the head
+// ---------------------------------------------------------------------------
+{
+    const relay = await startRelay();
+    try {
+        const CODE = newCode();
+        const base = `${relay.origin}/c/${CODE}`;
+        await connected({ relay: relay.origin, code: CODE });
+
+        // (a) the head declares 1000 bytes, the desktop sends 100 and ends.
+        // The phone never gets what the head promised, and until now the relay
+        // said nothing about it.
+        const short = await fetch(`${base}/api/short-hend`).then(
+            async r => ({ status: r.status, got: await Promise.race([r.text().then(t => t.length, () => 'cut'), sleep(2000).then(() => 'pending')]) }),
+            e => ({ status: 'error', got: String(e) })
+        );
+        check('a response that ends short of its content-length never reaches the phone whole', short.got !== 1000, JSON.stringify(short));
+        check('…and the short delivery is logged', await waitFor(() => /ended after .* of the .* it declared; the phone's stream is short/.test(relay.log()), 2000), relay.log());
+
+        // (b) the desktop fails a response whose head is already out.
+        const mid = await fetch(`${base}/api/herr-after-head`).then(
+            async r => ({ status: r.status, got: await Promise.race([r.text().then(t => t.length, () => 'cut'), sleep(2000).then(() => 'pending')]) }),
+            e => ({ status: 'error', got: String(e) })
+        );
+        check('a desktop failing mid-stream never reaches the phone whole', mid.got !== 1000, JSON.stringify(mid));
+        check('…and the failure is logged', await waitFor(() => /desktop failed response .* after .* of body \(the desktop gave up mid-response\); the phone's response is (destroyed|cut)/.test(relay.log()), 2000), relay.log());
+    } catch (e) {
+        check('suite: silent response endings', false, e.stack);
+        if (relay.log) console.log(relay.log());
+    } finally {
+        relay.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Suite 2: a relay gated by a shared registration key, with TURN
 // ---------------------------------------------------------------------------
 if (!EXTERNAL) {

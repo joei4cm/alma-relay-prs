@@ -384,6 +384,16 @@ export class TunnelDO extends DurableObject {
         // when the desktop registers; without the grace it is refused now.
         if (!agent && !this.agentGraceTimer) return offline();
 
+        // The Node edition caps the bridged sockets one desktop may have
+        // (MAX_SOCKETS_PER_AGENT, refused with 503 at the door). Without a
+        // cap here a token holder keeps opening sockets until the Durable
+        // Object's own limits stop them — and during a redial every held
+        // socket carries a pre-open queue as well.
+        const cap = limit(this.env.MAX_SOCKETS_PER_AGENT, 256);
+        if (cap && this.ctx.getWebSockets('client').length >= cap) {
+            return json(503, { error: 'Too many WebSockets on this relay' });
+        }
+
         const url = new URL(request.url);
         const id = this.nextId('w');
         const pair = new WebSocketPair();

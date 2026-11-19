@@ -597,6 +597,36 @@ if (EDITION === 'cloudflare') {
 }
 
 // ---------------------------------------------------------------------------
+// Suite 1.8 (Cloudflare edition): one desktop's bridged sockets are capped,
+// like the Node edition's MAX_SOCKETS_PER_AGENT
+// ---------------------------------------------------------------------------
+if (EDITION === 'cloudflare') {
+    const relay = await startRelay({ MAX_SOCKETS_PER_AGENT: '2' });
+    try {
+        const CODE = newCode();
+        const wsBase = `${relay.origin}/c/${CODE}`.replace(/^http/, 'ws');
+        await connected({ relay: relay.origin, code: CODE, proto: 3 });
+        const first = await openPhoneSocket(`${wsBase}/ws/echo`);
+        const second = await openPhoneSocket(`${wsBase}/ws/echo`);
+        check('a phone may open as many sockets as the cap allows', first.readyState === WebSocket.OPEN && second.readyState === WebSocket.OPEN, `${first.readyState}/${second.readyState}`);
+        const third = await openPhoneSocket(`${wsBase}/ws/echo`).then(ws => (ws.close(), 'opened'), e => e.message);
+        check('…and one more is refused', third !== 'opened', String(third));
+
+        // The cap counts sockets, not registrations: closing one frees a slot.
+        first.close();
+        await waitFor(() => first.readyState === WebSocket.CLOSED);
+        await sleep(300);
+        const fourth = await openPhoneSocket(`${wsBase}/ws/echo`).then(ws => (ws.close(), 'opened'), e => e.message);
+        check('…and a closed socket frees its slot', fourth === 'opened', String(fourth));
+    } catch (e) {
+        check('suite: bridged socket cap', false, e.stack);
+        if (relay.log) console.log(relay.log());
+    } finally {
+        relay.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Suite 2: a relay gated by a shared registration key, with TURN
 // ---------------------------------------------------------------------------
 if (!EXTERNAL) {

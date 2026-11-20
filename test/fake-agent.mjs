@@ -29,6 +29,8 @@ export class FakeAgent {
         // While true, request body bytes are neither written nor acknowledged.
         this.holdBodies = false;
         this.held = [];
+        // Responses the backend asked to be sent with a broken base64 body.
+        this.corruptIds = new Set();
         this.http = new Map();
         this.sockets = new Map();
         this.closed = null; // {code, reason} once the relay closes us
@@ -93,15 +95,15 @@ export class FakeAgent {
 
     /**
      * Response body bytes, as hchunk JSON (protocol 1) or HCHUNK (2).
-     * With `corrupt` (protocol 1 only) the base64 payload gets characters
-     * outside the alphabet in front of it: the relay must not fall over such
-     * a frame.
+     * A response the backend asked to be corrupted (protocol 1 only) gets
+     * characters outside the base64 alphabet in front of the payload: the
+     * relay must not fall over such a frame.
      */
-    sendBody(id, bytes, { corrupt = false } = {}) {
+    sendBody(id, bytes) {
         if (this.proto >= 2) return this.sendBinary(BIN.HCHUNK, id, bytes);
         this.stats.jsonData++;
         const b64 = Buffer.from(bytes).toString('base64');
-        this.send({ t: 'hchunk', id, b: corrupt ? `!!!${b64}` : b64 });
+        this.send({ t: 'hchunk', id, b: this.corruptIds.has(id) ? `!!!${b64}` : b64 });
     }
 
     sendWs(id, data, isBinary) {
@@ -169,16 +171,23 @@ export class FakeAgent {
         for (const fn of held) fn();
     }
 
+    /**
+     * Test paths the desktop answers itself, without the backend. Kept out of
+     * the frame switch so the switch stays a plain dispatch.
+     */
+    handleTestPath(frame) {
+        if (!frame.path.startsWith('/api/no-head')) return false;
+        this.sendBody(frame.id, Buffer.from('no-head-body'));
+        this.send({ t: 'hend', id: frame.id });
+        return true;
+    }
+
     onFrame(frame) {
         const { backendPort } = this.opts;
+        // Test paths the desktop answers itself, without the backend.
+        if (frame.t === 'hreq' && this.handleTestPath(frame)) return;
         switch (frame.t) {
             case 'hreq': {
-                // A test path: end the response before ever sending a head.
-                if (frame.path.startsWith('/api/no-head')) {
-                    this.sendBody(frame.id, Buffer.from('no-head-body'));
-                    this.send({ t: 'hend', id: frame.id });
-                    break;
-                }
                 const req = httpRequest(
                     {
                         host: '127.0.0.1',
@@ -190,16 +199,17 @@ export class FakeAgent {
                     res => {
                         // A backend that asks for it gets its body sent with a
                         // base64 payload that is not valid base64.
-                        const corrupt = res.headers['x-alma-corrupt-base64'] !== undefined;
-                        const headers = { ...res.headers };
-                        delete headers['x-alma-corrupt-base64'];
-                        this.send({ t: 'hres', id: frame.id, status: res.statusCode, headers });
+                        if (res.headers['x-alma-corrupt-base64'] !== undefined) {
+                            this.corruptIds.add(frame.id);
+                            delete res.headers['x-alma-corrupt-base64'];
+                        }
+                        this.send({ t: 'hres', id: frame.id, status: res.statusCode, headers: res.headers });
                         // Reading stops while anything holds it: the stream's window or the relay socket.
                         const holds = new Set();
                         const hold = why => (holds.add(why), res.pause());
                         const release = why => holds.delete(why) && !holds.size && res.resume();
                         res.on('data', chunk => {
-                            this.sendBody(frame.id, chunk, { corrupt });
+                            this.sendBody(frame.id, chunk);
                             this.spent(frame.id, chunk.length, () => hold('window'), () => release('window'));
                             // Like Alma's desktop, wait for the relay socket to drain.
                             if (this.ws.bufferedAmount > 1024 * 1024 && !holds.has('socket')) {

@@ -123,7 +123,7 @@ settings) on Cloudflare. All of them are optional.
 | `MAX_BODY_MB` | Request-body cap in MB (Node: `128`. Cloudflare: `100` for desktops on protocol 2, a fixed 24 for older ones). |
 | `MAX_BUFFERED_MB` | Node: cap on all request bodies held in memory at once, in MB (`512`); over it, `503`. Bodies to protocol-2 desktops are streamed and don't count. |
 | `MAX_AGENTS` | Node: most desktops at once (`10000`). |
-| `MAX_REQUESTS_PER_AGENT` / `MAX_SOCKETS_PER_AGENT` | Concurrent HTTP requests / bridged WebSockets per desktop (`256` each). Cloudflare applies the socket cap; its requests are capped by the Durable Object instead. |
+| `MAX_REQUESTS_PER_AGENT` / `MAX_SOCKETS_PER_AGENT` | Concurrent HTTP requests / bridged WebSockets per desktop (`256` each). Both editions apply both caps and refuse with `503`. |
 | `MAX_CONNECTIONS` | Node: TCP connection cap for the process (unset: no cap). |
 | `FLOW_STREAM_WINDOW_KB` | Protocol-3 desktops: how many KB of one stream a desktop may send ahead of the relay (`1024`). A slow phone then holds back only its own stream. See [protocol 3](docs/PROTOCOL.md#protocol-3). |
 | `FLOW_HIGH_WATER_MB` / `FLOW_LOW_WATER_MB` | Node: stop reading a desktop once one of its phones has this much queued, and read again below the low mark (`8` / `1`). A safety net for protocol-3 desktops. See [flow control](docs/PROTOCOL.md#flow-control-node-edition). |

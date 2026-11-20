@@ -171,7 +171,7 @@ edition had to hold whatever the desktop sent in Durable Object memory.
 | Un-acknowledged request body (protocol 2) | 4 MiB per request | 4 MiB per request |
 | Un-acknowledged response / WebSocket bytes (protocol 3) | 1 MiB per stream (`FLOW_STREAM_WINDOW_KB`) | 1 MiB per stream (`FLOW_STREAM_WINDOW_KB`) |
 | Desktops | 10 000 (`MAX_AGENTS`, then close `1013`) | — |
-| Concurrent requests / sockets per desktop | 256 / 256 (`MAX_REQUESTS_PER_AGENT`, `MAX_SOCKETS_PER_AGENT`, then `503`) | 256 sockets (`MAX_SOCKETS_PER_AGENT`, then `503`) |
+| Concurrent requests / sockets per desktop | 256 / 256 (`MAX_REQUESTS_PER_AGENT`, `MAX_SOCKETS_PER_AGENT`, then `503`) | 256 / 256 (`MAX_REQUESTS_PER_AGENT`, `MAX_SOCKETS_PER_AGENT`, then `503`) |
 | Registering | within 10 s of connecting | — |
 
 ## Flow control (Node edition)

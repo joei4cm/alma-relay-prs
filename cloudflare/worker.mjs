@@ -51,11 +51,6 @@ const limit = (value, fallback) => {
     const n = Number(value);
     return value !== undefined && value !== '' && Number.isFinite(n) && n >= 0 ? n : fallback;
 };
-// Protocol 2 streams request bodies, so they are capped by MAX_BODY_MB (and
-// by your plan's request size limit: 100 MB on Free and Pro), not by DO
-// message size.
-const streamMaxBody = env => limit(env.MAX_BODY_MB, 100) * MB || Infinity;
-const stallMs = env => limit(env.STALL_TIMEOUT_S, 60) * 1000;
 // How long bridged phone sockets are held open after the agent socket dies,
 // waiting for the desktop to redial (see agentDown). 0 = close them at once.
 const agentGraceMs = env => limit(env.AGENT_RECONNECT_GRACE_S, 10) * 1000;
@@ -64,6 +59,11 @@ const agentGraceMs = env => limit(env.AGENT_RECONNECT_GRACE_S, 10) * 1000;
 // without a close frame (1006 — the proxy path is the common case) is worth
 // waiting for: the desktop redials within seconds.
 const deliberateClose = code => code === 1000 || code === 1001;
+// Protocol 2 streams request bodies, so they are capped by MAX_BODY_MB (and
+// by your plan's request size limit: 100 MB on Free and Pro), not by DO
+// message size.
+const streamMaxBody = env => limit(env.MAX_BODY_MB, 100) * MB || Infinity;
+const stallMs = env => limit(env.STALL_TIMEOUT_S, 60) * 1000;
 const relayProtocol = env => negotiateProtocol(env.RELAY_PROTOCOL || PROTOCOL);
 const COALESCE_MS = 10;
 const TIMEOUT = Symbol('timeout');
@@ -433,6 +433,17 @@ export class TunnelDO extends DurableObject {
             if (k === 'host' || k === 'connection' || k === 'content-length' || k === 'accept-encoding' || k.startsWith('x-alma-tunnel') || k.startsWith('cf-'))
                 continue;
             headers[k] = value;
+        }
+
+        // The Node edition caps the concurrent requests one desktop may have
+        // (MAX_REQUESTS_PER_AGENT, refused with 503 at the door). The pending
+        // entries are exactly the requests in flight here: one per phone
+        // request, dropped when the response ends, fails or is cancelled.
+        // The check and the set below are adjacent, so no request can slip
+        // past the cap while another one is admitted.
+        const requestCap = limit(this.env.MAX_REQUESTS_PER_AGENT, 256);
+        if (requestCap && this.pending.size >= requestCap) {
+            return json(503, { error: 'Too many concurrent requests to this desktop' });
         }
 
         const entry = {
@@ -820,13 +831,13 @@ export class TunnelDO extends DurableObject {
             case 'hend': {
                 const entry = this.pending.get(frame.id);
                 if (!entry) return;
-                this.pending.delete(frame.id);
                 clearTimeout(entry.timer);
                 // The desktop may end the response before it ever sent a head.
                 // The Node edition answers that with a 200 (res.end()); here
                 // the head promise would otherwise never settle - the pending
                 // entry is already gone, so the head timer cannot fire either.
                 if (!entry.headersSent) entry.headResolve?.({ status: 200, headers: {} });
+                this.pending.delete(frame.id);
                 entry.close?.();
                 entry.wake?.(); // a body still being pumped stops
                 break;

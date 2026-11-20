@@ -55,6 +55,12 @@ const sha = b => createHash('sha256').update(b).digest('hex');
 const bigPayload = randomBytes(5 * 1024 * 1024);
 let lastSlowClosed = false;
 const firehose = { written: 0, closed: false };
+// Responses the backend keeps open until the test releases them: the request
+// stays in flight for as long as the test wants it to.
+const heldResponses = [];
+function releaseHeldResponses() {
+    while (heldResponses.length) heldResponses.shift().end();
+}
 
 const backend = createServer((req, res) => {
     if (req.url === '/api/health') {
@@ -101,6 +107,17 @@ const backend = createServer((req, res) => {
         res.writeHead(200, { 'content-type': 'text/event-stream' });
         res.write('data: first\n\n');
         res.on('close', () => (lastSlowClosed = true));
+        return;
+    }
+    if (req.url === '/api/hold') {
+        // A response that is never finished until the test says so.
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write('{"ok":true}');
+        heldResponses.push(res);
+        res.on('close', () => {
+            const at = heldResponses.indexOf(res);
+            if (at >= 0) heldResponses.splice(at, 1);
+        });
         return;
     }
     if (req.url === '/api/bad-b64') {
@@ -520,111 +537,6 @@ for (const PROTO of [1, 2, 3]) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Suite 1.5 (Cloudflare edition): the desktop's connection blips — bridged
-// phone sockets are held through the grace window and re-bridged on redial
-// ---------------------------------------------------------------------------
-if (EDITION === 'cloudflare') {
-    const relay = await startRelay({ AGENT_RECONNECT_GRACE_S: '3' });
-    try {
-        const CODE = newCode();
-        const base = `${relay.origin}/c/${CODE}`;
-        const wsBase = base.replace(/^http/, 'ws');
-        const agent = await connected({ relay: relay.origin, code: CODE, proto: 3 });
-        const ws = await openPhoneSocket(`${wsBase}/ws/echo`);
-        ws.send('before');
-        check('echo before the drop', await waitFor(() => ws.messages.includes('before')));
-
-        agent.drop(); // no close frame: the relay sees 1006, the blip case
-        await sleep(600);
-        check('a dropped desktop does not close the phone socket at once', ws.readyState === WebSocket.OPEN, `state=${ws.readyState}`);
-        const gap = await fetch(`${base}/api/health`).catch(e => ({ status: String(e) }));
-        check('…and HTTP during the gap gets 502', gap.status === 502, String(gap.status));
-        ws.send('during-gap');
-        const held = await openPhoneSocket(`${wsBase}/ws/hello`);
-        check('a phone socket opened during the gap is held, not refused', held.readyState === WebSocket.OPEN, `state=${held.readyState}`);
-
-        const agent2 = await connected({ relay: relay.origin, code: CODE, proto: 3 });
-        check(
-            'the redialled desktop re-bridges both phone sockets',
-            await waitFor(() => held.messages.includes('hello-from-desktop') && ws.messages.includes('during-gap'), 4000),
-            JSON.stringify({ held: held.messages, ws: ws.messages })
-        );
-
-        // No redial this time: once the grace expires the phones are told 1012.
-        // A socket the relay accepted while no desktop was connected is, under
-        // wrangler dev's local proxy, held in CLOSING for ~10 s after the close
-        // handshake before its TCP end lands — wait past that.
-        agent2.drop();
-        const codes = await Promise.all([ws, held].map(s => Promise.race([s.closedWith, sleep(25_000).then(() => 'open')])));
-        check('grace expiry closes the held phone sockets', codes.every(c => c === 1012), JSON.stringify(codes));
-        const after = await fetch(`${base}/api/health`);
-        check('…and later requests get 502', after.status === 502, String(after.status));
-    } catch (e) {
-        check('suite: reconnect grace', false, e.stack);
-        if (relay.log) console.log(relay.log());
-    } finally {
-        relay.stop();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Suite 1.6 (Cloudflare edition): a desktop that closes its socket cleanly
-// (1000) has left on purpose — the phones are dropped at once, no grace
-// ---------------------------------------------------------------------------
-if (EDITION === 'cloudflare') {
-    const relay = await startRelay({ AGENT_RECONNECT_GRACE_S: '5' });
-    try {
-        const CODE = newCode();
-        const wsBase = `${relay.origin}/c/${CODE}`.replace(/^http/, 'ws');
-        const agent = await connected({ relay: relay.origin, code: CODE, proto: 3 });
-        const ws = await openPhoneSocket(`${wsBase}/ws/echo`);
-        ws.send('before');
-        check('echo before the clean close', await waitFor(() => ws.messages.includes('before')));
-
-        agent.close(); // a close frame: the desktop quit, not the path dying
-        // Under the grace this socket would live the full 5 s; it must not.
-        const code = await Promise.race([ws.closedWith, sleep(3000 * SLACK).then(() => 'open')]);
-        check('a clean desktop close drops the phone socket at once', code === 1012, String(code));
-        const after = await fetch(`${relay.origin}/c/${CODE}/api/health`);
-        check('…and later requests get 502', after.status === 502, String(after.status));
-    } catch (e) {
-        check('suite: clean close needs no grace', false, e.stack);
-        if (relay.log) console.log(relay.log());
-    } finally {
-        relay.stop();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Suite 1.8 (Cloudflare edition): one desktop's bridged sockets are capped,
-// like the Node edition's MAX_SOCKETS_PER_AGENT
-// ---------------------------------------------------------------------------
-if (EDITION === 'cloudflare') {
-    const relay = await startRelay({ MAX_SOCKETS_PER_AGENT: '2' });
-    try {
-        const CODE = newCode();
-        const wsBase = `${relay.origin}/c/${CODE}`.replace(/^http/, 'ws');
-        await connected({ relay: relay.origin, code: CODE, proto: 3 });
-        const first = await openPhoneSocket(`${wsBase}/ws/echo`);
-        const second = await openPhoneSocket(`${wsBase}/ws/echo`);
-        check('a phone may open as many sockets as the cap allows', first.readyState === WebSocket.OPEN && second.readyState === WebSocket.OPEN, `${first.readyState}/${second.readyState}`);
-        const third = await openPhoneSocket(`${wsBase}/ws/echo`).then(ws => (ws.close(), 'opened'), e => e.message);
-        check('…and one more is refused', third !== 'opened', String(third));
-
-        // The cap counts sockets, not registrations: closing one frees a slot.
-        first.close();
-        await waitFor(() => first.readyState === WebSocket.CLOSED);
-        await sleep(300);
-        const fourth = await openPhoneSocket(`${wsBase}/ws/echo`).then(ws => (ws.close(), 'opened'), e => e.message);
-        check('…and a closed socket frees its slot', fourth === 'opened', String(fourth));
-    } catch (e) {
-        check('suite: bridged socket cap', false, e.stack);
-        if (relay.log) console.log(relay.log());
-    } finally {
-        relay.stop();
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Suite 2: a relay gated by a shared registration key, with TURN
@@ -756,6 +668,145 @@ if (EDITION === 'cloudflare') {
         moved.close();
     } catch (e) {
         check('suite: legacy tunnels', false, e.stack);
+        if (relay.log) console.log(relay.log());
+    } finally {
+        relay.stop();
+    }
+}
+// ---------------------------------------------------------------------------
+// Suite 1.5 (Cloudflare edition): the desktop's connection blips — bridged
+// phone sockets are held through the grace window and re-bridged on redial
+// ---------------------------------------------------------------------------
+if (EDITION === 'cloudflare') {
+    const relay = await startRelay({ AGENT_RECONNECT_GRACE_S: '3' });
+    try {
+        const CODE = newCode();
+        const base = `${relay.origin}/c/${CODE}`;
+        const wsBase = base.replace(/^http/, 'ws');
+        const agent = await connected({ relay: relay.origin, code: CODE, proto: 3 });
+        const ws = await openPhoneSocket(`${wsBase}/ws/echo`);
+        ws.send('before');
+        check('echo before the drop', await waitFor(() => ws.messages.includes('before')));
+
+        agent.drop(); // no close frame: the relay sees 1006, the blip case
+        await sleep(600);
+        check('a dropped desktop does not close the phone socket at once', ws.readyState === WebSocket.OPEN, `state=${ws.readyState}`);
+        const gap = await fetch(`${base}/api/health`).catch(e => ({ status: String(e) }));
+        check('…and HTTP during the gap gets 502', gap.status === 502, String(gap.status));
+        ws.send('during-gap');
+        const held = await openPhoneSocket(`${wsBase}/ws/hello`);
+        check('a phone socket opened during the gap is held, not refused', held.readyState === WebSocket.OPEN, `state=${held.readyState}`);
+
+        const agent2 = await connected({ relay: relay.origin, code: CODE, proto: 3 });
+        check(
+            'the redialled desktop re-bridges both phone sockets',
+            await waitFor(() => held.messages.includes('hello-from-desktop') && ws.messages.includes('during-gap'), 4000),
+            JSON.stringify({ held: held.messages, ws: ws.messages })
+        );
+
+        // No redial this time: once the grace expires the phones are told 1012.
+        // A socket the relay accepted while no desktop was connected is, under
+        // wrangler dev's local proxy, held in CLOSING for ~10 s after the close
+        // handshake before its TCP end lands — wait past that.
+        agent2.drop();
+        const codes = await Promise.all([ws, held].map(s => Promise.race([s.closedWith, sleep(25_000).then(() => 'open')])));
+        check('grace expiry closes the held phone sockets', codes.every(c => c === 1012), JSON.stringify(codes));
+        const after = await fetch(`${base}/api/health`);
+        check('…and later requests get 502', after.status === 502, String(after.status));
+    } catch (e) {
+        check('suite: reconnect grace', false, e.stack);
+        if (relay.log) console.log(relay.log());
+    } finally {
+        relay.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Suite 1.6 (Cloudflare edition): a desktop that closes its socket cleanly
+// (1000) has left on purpose — the phones are dropped at once, no grace
+// ---------------------------------------------------------------------------
+if (EDITION === 'cloudflare') {
+    const relay = await startRelay({ AGENT_RECONNECT_GRACE_S: '5' });
+    try {
+        const CODE = newCode();
+        const wsBase = `${relay.origin}/c/${CODE}`.replace(/^http/, 'ws');
+        const agent = await connected({ relay: relay.origin, code: CODE, proto: 3 });
+        const ws = await openPhoneSocket(`${wsBase}/ws/echo`);
+        ws.send('before');
+        check('echo before the clean close', await waitFor(() => ws.messages.includes('before')));
+
+        agent.close(); // a close frame: the desktop quit, not the path dying
+        // Under the grace this socket would live the full 5 s; it must not.
+        const code = await Promise.race([ws.closedWith, sleep(3000 * SLACK).then(() => 'open')]);
+        check('a clean desktop close drops the phone socket at once', code === 1012, String(code));
+        const after = await fetch(`${relay.origin}/c/${CODE}/api/health`);
+        check('…and later requests get 502', after.status === 502, String(after.status));
+    } catch (e) {
+        check('suite: clean close needs no grace', false, e.stack);
+        if (relay.log) console.log(relay.log());
+    } finally {
+        relay.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Suite 1.8 (Cloudflare edition): one desktop's bridged sockets are capped,
+// like the Node edition's MAX_SOCKETS_PER_AGENT
+// ---------------------------------------------------------------------------
+if (EDITION === 'cloudflare') {
+    const relay = await startRelay({ MAX_SOCKETS_PER_AGENT: '2' });
+    try {
+        const CODE = newCode();
+        const wsBase = `${relay.origin}/c/${CODE}`.replace(/^http/, 'ws');
+        await connected({ relay: relay.origin, code: CODE, proto: 3 });
+        const first = await openPhoneSocket(`${wsBase}/ws/echo`);
+        const second = await openPhoneSocket(`${wsBase}/ws/echo`);
+        check('a phone may open as many sockets as the cap allows', first.readyState === WebSocket.OPEN && second.readyState === WebSocket.OPEN, `${first.readyState}/${second.readyState}`);
+        const third = await openPhoneSocket(`${wsBase}/ws/echo`).then(ws => (ws.close(), 'opened'), e => e.message);
+        check('…and one more is refused', third !== 'opened', String(third));
+
+        // The cap counts sockets, not registrations: closing one frees a slot.
+        first.close();
+        await waitFor(() => first.readyState === WebSocket.CLOSED);
+        await sleep(300);
+        const fourth = await openPhoneSocket(`${wsBase}/ws/echo`).then(ws => (ws.close(), 'opened'), e => e.message);
+        check('…and a closed socket frees its slot', fourth === 'opened', String(fourth));
+    } catch (e) {
+        check('suite: bridged socket cap', false, e.stack);
+        if (relay.log) console.log(relay.log());
+    } finally {
+        relay.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Suite 1.9 (Cloudflare edition): one desktop's concurrent requests are
+// capped, like the Node edition's MAX_REQUESTS_PER_AGENT
+// ---------------------------------------------------------------------------
+if (EDITION === 'cloudflare') {
+    const relay = await startRelay({ MAX_REQUESTS_PER_AGENT: '2' });
+    try {
+        const CODE = newCode();
+        const base = `${relay.origin}/c/${CODE}`;
+        const agent = await connected({ relay: relay.origin, code: CODE, proto: 3 });
+
+        // Two requests the backend keeps open stay in flight.
+        const held = [fetch(`${base}/api/hold`), fetch(`${base}/api/hold`)];
+        check('both requests reach the desktop', await waitFor(() => agent.hreqs.length === 2), `${agent.hreqs.length} requests`);
+
+        const third = await fetch(`${base}/api/health`);
+        check('MAX_REQUESTS_PER_AGENT → 503', third.status === 503, `status=${third.status}`);
+        check('…and the phone is told why', (await third.json().catch(() => null))?.error === 'Too many concurrent requests to this desktop');
+
+        // The backend finishes them: the slots are free again.
+        releaseHeldResponses();
+        const answers = await Promise.all(held.map(p => p.then(r => r.text().catch(() => ''), () => '')));
+        check('the held requests are answered', answers.every(a => a.includes('ok')), answers.join(','));
+        await sleep(300);
+        const after = await fetch(`${base}/api/health`);
+        check('request slots free up again', after.status === 200, `status=${after.status}`);
+    } catch (e) {
+        check('suite: concurrent request cap', false, e.stack);
         if (relay.log) console.log(relay.log());
     } finally {
         relay.stop();
